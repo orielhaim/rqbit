@@ -7,12 +7,30 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use librqbit_core::{hash_id::Id20, spawn_utils::spawn_with_cancel};
+use librqbit_core::{
+    hash_id::Id20, network_policy::is_public_socket_addr, spawn_utils::spawn_with_cancel,
+};
 use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use parking_lot::RwLock;
 use rand::RngExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, debug_span, trace, warn};
+
+async fn send_public_datagram(
+    socket: &UdpSocket,
+    bytes: &[u8],
+    addr: SocketAddr,
+    allow_test_local: bool,
+) -> std::io::Result<()> {
+    let local_fixture_enabled = cfg!(any(test, all(feature = "test-loopback", debug_assertions)));
+    if !is_public_socket_addr(addr) && !(local_fixture_enabled && allow_test_local) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing non-public UDP tracker destination {addr}"),
+        ));
+    }
+    socket.send_to(bytes, addr).await.map(|_| ())
+}
 
 const ACTION_CONNECT: u32 = 0;
 const ACTION_ANNOUNCE: u32 = 1;
@@ -359,11 +377,14 @@ impl UdpTrackerClient {
 
         let mut write_buf = [0u8; 1024];
         let len = request.serialize(tid_g.tid, &mut write_buf)?;
-        self.state
-            .sock
-            .send_to(&write_buf[..len], addr)
-            .await
-            .with_context(|| format!("error sending to {addr:?}"))?;
+        send_public_datagram(
+            &self.state.sock,
+            &write_buf[..len],
+            addr,
+            cfg!(any(test, all(feature = "test-loopback", debug_assertions))),
+        )
+        .await
+        .with_context(|| format!("error sending to {addr:?}"))?;
 
         let response = tokio::time::timeout(Duration::from_secs(10), rx)
             .await
@@ -419,13 +440,39 @@ impl UdpTrackerClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, str::FromStr};
+    use std::{io::Write, str::FromStr, time::Duration};
 
     use librqbit_core::{hash_id::Id20, peer_id::generate_peer_id};
+    use librqbit_dualstack_sockets::{BindOpts, UdpSocket};
 
     use crate::tracker_comms_udp::{
         AnnounceFields, EVENT_NONE, Request, Response, new_transaction_id,
     };
+    use super::send_public_datagram;
+
+    #[tokio::test]
+    async fn udp_tracker_send_guard_rejects_local_destinations_without_sending() {
+        let sender = UdpSocket::bind_udp(
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            BindOpts::default(),
+        )
+        .unwrap();
+        let receiver = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let error =
+            send_public_datagram(&sender, b"announce", receiver.local_addr().unwrap(), false)
+                .await
+                .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let mut buf = [0; 16];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn test_parse_announce() {

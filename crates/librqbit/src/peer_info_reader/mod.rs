@@ -30,6 +30,8 @@ use crate::{
     stream_connect::{ConnectionKind, StreamConnector},
 };
 
+const MAX_METADATA_SIZE_BYTES: u32 = 512 * 1024;
+
 pub(crate) async fn read_metainfo_from_peer(
     addr: SocketAddr,
     peer_id: Id20,
@@ -84,7 +86,7 @@ struct HandlerLocked {
 
 impl HandlerLocked {
     fn new(metadata_size: u32) -> anyhow::Result<Self> {
-        if metadata_size > 32 * 1024 * 1024 {
+        if metadata_size > MAX_METADATA_SIZE_BYTES {
             anyhow::bail!("metadata size {} is too big", metadata_size);
         }
         let buffer = vec![0u8; metadata_size as usize];
@@ -144,6 +146,17 @@ impl HandlerLocked {
         } else {
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_size_tests {
+    use super::{HandlerLocked, MAX_METADATA_SIZE_BYTES};
+
+    #[test]
+    fn peer_metadata_has_a_512_kib_hard_limit() {
+        assert!(HandlerLocked::new(MAX_METADATA_SIZE_BYTES).is_ok());
+        assert!(HandlerLocked::new(MAX_METADATA_SIZE_BYTES + 1).is_err());
     }
 }
 

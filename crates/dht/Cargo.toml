@@ -8,6 +8,9 @@ documentation = "https://docs.rs/librqbit-dht"
 repository = "https://github.com/ikatson/rqbit"
 readme = "README.md"
 
+[features]
+test-loopback = []
+
 [dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "sync"] }
 tokio-stream = { workspace = true, features = ["sync"] }

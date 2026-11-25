@@ -9,6 +9,9 @@ repository = "https://github.com/ikatson/rqbit"
 readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+test-loopback = []
+
 [dependencies]
 tokio.workspace = true
 anyhow.workspace = true

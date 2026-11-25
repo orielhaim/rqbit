@@ -25,6 +25,7 @@ use crate::tracker_comms_http;
 use crate::tracker_comms_udp;
 use crate::tracker_comms_udp::UdpTrackerClient;
 use librqbit_core::hash_id::Id20;
+use librqbit_core::network_policy::is_public_socket_addr;
 
 pub struct TrackerComms {
     info_hash: Id20,
@@ -81,6 +82,28 @@ impl TorrentStatsProvider for () {
 }
 
 type Sender = tokio::sync::mpsc::Sender<SocketAddr>;
+const MAX_HTTP_TRACKER_RESPONSE_BYTES: usize = 1024 * 1024;
+
+async fn read_bounded_response(mut response: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_HTTP_TRACKER_RESPONSE_BYTES as u64)
+    {
+        bail!("HTTP tracker response is too large");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > MAX_HTTP_TRACKER_RESPONSE_BYTES)
+        {
+            bail!("HTTP tracker response is too large");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
 
 enum SupportedTracker {
     Udp(Url),
@@ -105,6 +128,7 @@ enum UdpTrackerResolveResult {
 async fn udp_tracker_to_socket_addrs(
     host: url::Host<&str>,
     port: u16,
+    allow_test_local: bool,
 ) -> anyhow::Result<UdpTrackerResolveResult> {
     let res = match host {
         url::Host::Domain(name) => {
@@ -116,6 +140,11 @@ async fn udp_tracker_to_socket_addrs(
                 .await
                 .with_context(|| format!("error looking up hostname {name}"))?
             {
+                if !is_public_socket_addr(addr)
+                    && !(local_tracker_fixtures_enabled() && allow_test_local)
+                {
+                    continue;
+                }
                 match (v4, v6, addr) {
                     (None, _, SocketAddr::V4(addr)) => v4 = Some(addr),
                     (_, None, SocketAddr::V6(addr)) => v6 = Some(addr),
@@ -134,7 +163,43 @@ async fn udp_tracker_to_socket_addrs(
         url::Host::Ipv4(addr) => UdpTrackerResolveResult::One((addr, port).into()),
         url::Host::Ipv6(addr) => UdpTrackerResolveResult::One((addr, port).into()),
     };
+    match res {
+        UdpTrackerResolveResult::One(addr)
+            if !is_public_socket_addr(addr)
+                && !(local_tracker_fixtures_enabled() && allow_test_local) =>
+        {
+            anyhow::bail!("refusing non-public UDP tracker destination {addr}");
+        }
+        UdpTrackerResolveResult::Two(v4, v6)
+            if (!is_public_socket_addr(v4.into()) || !is_public_socket_addr(v6.into()))
+                && !(local_tracker_fixtures_enabled() && allow_test_local) =>
+        {
+            anyhow::bail!("refusing non-public UDP tracker destination");
+        }
+        _ => {}
+    }
     Ok(res)
+}
+
+fn ensure_public_tracker_url(url: &Url, allow_test_local: bool) -> anyhow::Result<()> {
+    if let Some(host) = url.host() {
+        let ip = match host {
+            url::Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
+            url::Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
+            url::Host::Domain(_) => None,
+        };
+        if let Some(ip) = ip
+            && !librqbit_core::network_policy::is_public_ip(ip)
+            && !(local_tracker_fixtures_enabled() && allow_test_local)
+        {
+            bail!("refusing non-public tracker URL {url}");
+        }
+    }
+    Ok(())
+}
+
+fn local_tracker_fixtures_enabled() -> bool {
+    cfg!(any(test, all(feature = "test-loopback", debug_assertions)))
 }
 
 impl TrackerComms {
@@ -290,11 +355,12 @@ impl TrackerComms {
         }
         url.set_query(Some(&queries));
 
+        ensure_public_tracker_url(&url, cfg!(test))?;
         let response: reqwest::Response = self.reqwest_client.get(url).send().await?;
         if !response.status().is_success() {
             anyhow::bail!("tracker responded with {:?}", response.status());
         }
-        let bytes = response.bytes().await?;
+        let bytes = read_bounded_response(response).await?;
         if let Ok((error, _)) =
             bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
         {
@@ -341,7 +407,7 @@ impl TrackerComms {
 
             // This should retry forever until the addrs are resolved.
             let addrs = (async || {
-                udp_tracker_to_socket_addrs(host.clone(), port)
+                udp_tracker_to_socket_addrs(host.clone(), port, local_tracker_fixtures_enabled())
                     .instrument(trace_span!("resolve", ?host))
                     .await
                     .or_else(|err| prev_addrs.ok_or(err))
@@ -434,5 +500,31 @@ impl TrackerComms {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::{ensure_public_tracker_url, udp_tracker_to_socket_addrs};
+    use std::net::Ipv4Addr;
+    use url::{Host, Url};
+
+    #[test]
+    fn rejects_literal_non_public_http_tracker_urls() {
+        for raw in [
+            "http://127.0.0.1:8080/announce",
+            "https://192.168.1.10/announce",
+        ] {
+            let url = Url::parse(raw).unwrap();
+            assert!(ensure_public_tracker_url(&url, false).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_literal_non_public_udp_tracker_destinations() {
+        let error = udp_tracker_to_socket_addrs(Host::Ipv4(Ipv4Addr::LOCALHOST), 6969, false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("non-public"));
     }
 }

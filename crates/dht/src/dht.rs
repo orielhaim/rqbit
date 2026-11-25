@@ -31,6 +31,7 @@ use librqbit_core::{
     compact_ip::{CompactSerialize, CompactSerializeFixedLen},
     crate_version,
     hash_id::Id20,
+    network_policy::is_public_socket_addr,
     peer_id::generate_azereus_style,
     spawn_utils::{spawn, spawn_with_cancel},
 };
@@ -45,6 +46,22 @@ use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 
 fn now() -> Instant {
     Instant::now()
+}
+
+async fn send_public_datagram(
+    socket: &UdpSocket,
+    bytes: &[u8],
+    addr: SocketAddr,
+    allow_test_local: bool,
+) -> std::io::Result<()> {
+    let local_fixture_enabled = cfg!(any(test, all(feature = "test-loopback", debug_assertions)));
+    if !is_public_socket_addr(addr) && !(local_fixture_enabled && allow_test_local) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing non-public DHT destination {addr}"),
+        ));
+    }
+    socket.send_to(bytes, addr).await.map(|_| ())
 }
 
 #[derive(Debug, Serialize)]
@@ -1187,7 +1204,14 @@ impl DhtWorker {
                     message.kind,
                 )
                 .unwrap();
-                if let Err(e) = socket.send_to(&buf, addr).await {
+                if let Err(e) = send_public_datagram(
+                    socket,
+                    &buf,
+                    addr,
+                    cfg!(any(test, all(feature = "test-loopback", debug_assertions))),
+                )
+                .await
+                {
                     debug!("error sending to {addr}: {e:#}");
                     if let Some(tid) = our_tid {
                         self.on_send_error(tid, addr, Error::Send(e));
@@ -1430,11 +1454,33 @@ mod tests {
     use bencode::ByteBufOwned;
     use tokio::net::UdpSocket;
 
-    use super::{DhtConfig, DhtState};
+    use super::{DhtConfig, DhtState, UdpSocket as DualstackUdpSocket, send_public_datagram};
     use crate::{
         Dht,
         bprotocol::{self, MessageKind},
     };
+
+    #[tokio::test]
+    async fn dht_send_guard_rejects_local_destinations_without_sending() {
+        let sender =
+            DualstackUdpSocket::bind_udp((Ipv4Addr::LOCALHOST, 0).into(), Default::default())
+                .unwrap();
+        let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = receiver.local_addr().unwrap();
+
+        let error = send_public_datagram(&sender, b"test", addr, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let mut buf = [0; 8];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv_from(&mut buf))
+                .await
+                .is_err()
+        );
+    }
 
     async fn start_dht(bootstrap_addr: SocketAddr) -> Dht {
         DhtState::with_config(DhtConfig {

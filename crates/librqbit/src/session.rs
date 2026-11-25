@@ -58,6 +58,7 @@ use librqbit_core::{
     crate_version,
     directories::get_configuration_directory,
     magnet::Magnet,
+    network_policy::is_public_ip,
     peer_id::generate_azereus_style,
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info},
@@ -74,6 +75,59 @@ use tracker_comms::{TrackerComms, UdpTrackerClient};
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
+const MAX_TORRENT_FILE_BYTES: usize = 1024 * 1024;
+const MAX_TORRENT_FILES: usize = 1024;
+const MAX_TORRENT_INFO_BYTES: usize = 512 * 1024;
+
+struct PublicOnlyDnsResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let addresses = addresses
+                .filter(|addr| ip_is_public_for_network_egress(addr.ip()))
+                .collect::<Vec<_>>();
+            if addresses.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("hostname {host} has no public IP addresses"),
+                )
+                .into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn ip_is_public_for_network_egress(ip: std::net::IpAddr) -> bool {
+    is_public_ip(ip) || local_network_fixtures_enabled()
+}
+
+fn local_network_fixtures_enabled() -> bool {
+    cfg!(any(test, all(feature = "test-loopback", debug_assertions)))
+}
+
+fn redirect_url_host_is_public_in_production(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => is_public_ip(ip.into()),
+        Some(url::Host::Ipv6(ip)) => is_public_ip(ip.into()),
+        Some(url::Host::Domain(_)) => true,
+        None => false,
+    }
+}
+
+fn redirect_target_allowed(
+    url: &url::Url,
+    previous_requests: usize,
+    allow_test_local: bool,
+) -> bool {
+    previous_requests <= 4
+        && (redirect_url_host_is_public_in_production(url)
+            || (allow_test_local && local_network_fixtures_enabled()))
+}
+
 pub type TorrentId = usize;
 
 struct ParsedTorrentFile {
@@ -82,15 +136,61 @@ struct ParsedTorrentFile {
 }
 
 fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
+    if bytes.len() > MAX_TORRENT_FILE_BYTES {
+        bail!("torrent file is larger than {MAX_TORRENT_FILE_BYTES} bytes");
+    }
     trace!(
         "all fields in torrent: {:#?}",
         bencode::dyn_from_bytes::<ByteBuf>(&bytes)
     );
     let parsed = librqbit_core::torrent_metainfo::torrent_from_bytes(&bytes)?;
+    if parsed.info.raw_bytes.as_ref().len() > MAX_TORRENT_INFO_BYTES {
+        bail!("torrent info dictionary is larger than {MAX_TORRENT_INFO_BYTES} bytes");
+    }
     Ok(ParsedTorrentFile {
         meta: parsed.clone_to_owned(Some(&bytes)),
         torrent_bytes: bytes,
     })
+}
+
+async fn torrent_from_url(
+    reqwest_client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<ParsedTorrentFile> {
+    let parsed_url = url::Url::parse(url).context("invalid torrent metadata URL")?;
+    if !redirect_target_allowed(&parsed_url, 0, local_network_fixtures_enabled()) {
+        bail!("refusing non-public torrent metadata URL {url}");
+    }
+    let mut response = reqwest_client
+        .get(parsed_url)
+        .send()
+        .await
+        .context("error downloading torrent metadata")?;
+    if !response.status().is_success() {
+        bail!("GET {} returned {}", url, response.status());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_TORRENT_FILE_BYTES as u64)
+    {
+        bail!("torrent metadata response is too large");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("error reading torrent metadata response")?
+    {
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > MAX_TORRENT_FILE_BYTES)
+        {
+            bail!("torrent metadata response is too large");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    torrent_from_bytes(Bytes::from(bytes)).context("error decoding torrent")
 }
 
 #[derive(Default)]
@@ -160,25 +260,6 @@ fn is_bare_info_hash(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-async fn torrent_from_url(
-    reqwest_client: &reqwest::Client,
-    url: &str,
-) -> anyhow::Result<ParsedTorrentFile> {
-    let response = reqwest_client
-        .get(url)
-        .send()
-        .await
-        .context("error downloading torrent metadata")?;
-    if !response.status().is_success() {
-        bail!("GET {} returned {}", url, response.status())
-    }
-    let b = response
-        .bytes()
-        .await
-        .with_context(|| format!("error reading response body from {url}"))?;
-    torrent_from_bytes(b).context("error decoding torrent")
-}
-
 fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
     torrent: &ValidatedTorrentMetaV1Info<ByteBuf>,
     filename_re: &str,
@@ -197,6 +278,13 @@ fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
     Ok(only_files)
 }
 
+fn validate_torrent_file_count(count: usize) -> anyhow::Result<()> {
+    if count > MAX_TORRENT_FILES {
+        bail!("torrent contains more than {MAX_TORRENT_FILES} files");
+    }
+    Ok(())
+}
+
 fn compute_only_files(
     info: &ValidatedTorrentMetaV1Info<ByteBufOwned>,
     only_files: Option<Vec<usize>>,
@@ -209,6 +297,7 @@ fn compute_only_files(
         }
         (Some(only_files), None) => {
             let total_files = info.iter_file_lengths().count();
+            validate_torrent_file_count(total_files)?;
             for id in only_files.iter().copied() {
                 if id >= total_files {
                     bail!("file id {} is out of range", id);
@@ -217,6 +306,8 @@ fn compute_only_files(
             Ok(Some(only_files))
         }
         (None, Some(filename_re)) => {
+            let total_files = info.iter_file_lengths().count();
+            validate_torrent_file_count(total_files)?;
             let only_files = compute_only_files_regex(info, &filename_re)?;
             for (idx, fd) in info.iter_file_details().enumerate() {
                 if !only_files.contains(&idx) {
@@ -228,7 +319,10 @@ fn compute_only_files(
             }
             Ok(Some(only_files))
         }
-        (None, None) => Ok(None),
+        (None, None) => {
+            validate_torrent_file_count(info.iter_file_lengths().count())?;
+            Ok(None)
+        }
     }
 }
 
@@ -710,22 +804,41 @@ impl Session {
                 .client_name_and_version
                 .unwrap_or_else(|| crate::client_name_and_version().to_owned());
 
+            if proxy_url.is_some_and(|url| {
+                url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "socks5h")
+            }) {
+                bail!("socks5h proxies are disabled by public-only HTTP destination policy");
+            }
+
             let reqwest_client = {
-                let builder = if let Some(proxy_url) = proxy_url {
+                let mut builder = reqwest::Client::builder().no_proxy();
+                if let Some(proxy_url) = proxy_url {
                     let proxy = reqwest::Proxy::all(proxy_url)
                         .context("error creating socks5 proxy for HTTP")?;
-                    reqwest::Client::builder().proxy(proxy)
-                } else {
-                    #[allow(unused_mut)]
-                    let mut b = reqwest::Client::builder();
-                    #[cfg(not(windows))]
-                    if let Some(bd) = opts.bind_device_name.as_ref() {
-                        b = b.interface(bd);
-                    }
-                    b
-                };
+                    builder = builder.proxy(proxy);
+                }
+                #[cfg(not(windows))]
+                if let Some(bd) = opts.bind_device_name.as_ref() {
+                    builder = builder.interface(bd);
+                }
 
                 builder
+                    .dns_resolver(Arc::new(PublicOnlyDnsResolver))
+                    .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                        if redirect_target_allowed(
+                            attempt.url(),
+                            attempt.previous().len(),
+                            local_network_fixtures_enabled(),
+                        ) {
+                            attempt.follow()
+                        } else {
+                            attempt.error(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "redirect limit exceeded or target is not public",
+                            ))
+                        }
+                    }))
+                    .timeout(Duration::from_secs(30))
                     .user_agent(&client_name_and_version)
                     .build()
                     .context("error building HTTP(S) client")?
@@ -1822,9 +1935,12 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
 mod tests {
     use buffers::ByteBuf;
     use itertools::Itertools;
-    use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes};
+    use librqbit_core::torrent_metainfo::{TorrentMetaV1, torrent_from_bytes as parse_torrent_from_bytes};
 
-    use super::{is_bare_info_hash, torrent_file_from_info_bytes};
+    use super::{
+        is_bare_info_hash, redirect_target_allowed, torrent_file_from_info_bytes,
+        validate_torrent_file_count,
+    };
 
     #[test]
     fn test_is_bare_info_hash() {
@@ -1844,6 +1960,72 @@ mod tests {
     }
 
     #[test]
+    fn public_http_redirect_policy_rejects_non_public_literal_hosts() {
+        for url in [
+            "http://127.0.0.1:8080/",
+            "https://[::1]/",
+            "http://192.168.1.1/",
+        ] {
+            assert!(!redirect_target_allowed(&url.parse().unwrap(), 1, false));
+        }
+        assert!(redirect_target_allowed(
+            &"https://1.1.1.1/".parse().unwrap(),
+            1,
+            false
+        ));
+        assert!(!redirect_target_allowed(
+            &"https://1.1.1.1/".parse().unwrap(),
+            5,
+            false
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_torrent_body_limit_applies_without_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 512];
+            while !request.ends_with(b"\r\n\r\n") {
+                let size = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(size, 0, "request ended before its headers");
+                request.extend_from_slice(&chunk[..size]);
+            }
+            let body = vec![b'x'; super::MAX_TORRENT_FILE_BYTES + 1];
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = stream.write_all(&body).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let error = super::torrent_from_url(&client, &format!("http://{address}/torrent"))
+            .await
+            .err()
+            .expect("oversized response should be rejected");
+
+        assert!(
+            format!("{error:#}").contains("response is too large"),
+            "unexpected error: {error:#}"
+        );
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn caps_torrent_file_count() {
+        assert!(validate_torrent_file_count(1024).is_ok());
+        assert!(validate_torrent_file_count(1025).is_err());
+    }
+
+    #[test]
     fn test_torrent_file_from_info_and_bytes() {
         fn get_trackers(info: &TorrentMetaV1<ByteBuf>) -> Vec<url::Url> {
             info.iter_announce()
@@ -1854,12 +2036,12 @@ mod tests {
 
         let orig_full_torrent =
             include_bytes!("../resources/ubuntu-21.04-desktop-amd64.iso.torrent");
-        let parsed = torrent_from_bytes(&orig_full_torrent[..]).unwrap();
+        let parsed = parse_torrent_from_bytes(&orig_full_torrent[..]).unwrap();
         let parsed_trackers = get_trackers(&parsed);
 
         let generated_torrent =
             torrent_file_from_info_bytes(parsed.info.raw_bytes.as_ref(), &parsed_trackers).unwrap();
-        let generated_parsed = torrent_from_bytes(generated_torrent.as_ref()).unwrap();
+        let generated_parsed = parse_torrent_from_bytes(generated_torrent.as_ref()).unwrap();
         assert_eq!(parsed.info_hash, generated_parsed.info_hash);
         assert_eq!(parsed.info, generated_parsed.info);
         assert_eq!(parsed_trackers, get_trackers(&generated_parsed));

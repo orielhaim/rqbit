@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use async_compression::tokio::bufread::GzipDecoder;
 use futures::TryStreamExt;
 use intervaltree::IntervalTree;
+use librqbit_core::network_policy::is_public_ip;
 use std::iter::empty;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
@@ -67,6 +68,18 @@ impl IpRanges {
                 .ok()
                 .context("failed to convert file URL to path")?;
             return Self::load_from_file(path).await;
+        }
+
+        let host_ip = match parsed_url.host() {
+            Some(url::Host::Ipv4(ip)) => Some(std::net::IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => Some(std::net::IpAddr::V6(ip)),
+            Some(url::Host::Domain(_)) => None,
+            None => anyhow::bail!("URL has no host"),
+        };
+        if host_ip.is_some_and(|ip| {
+            !is_public_ip(ip) && !cfg!(any(test, all(feature = "test-loopback", debug_assertions)))
+        }) {
+            anyhow::bail!("refusing non-public HTTP list URL {parsed_url}");
         }
 
         let response = client

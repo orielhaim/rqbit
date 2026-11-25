@@ -12,6 +12,7 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
+test-loopback = ["dht/test-loopback", "tracker_comms/test-loopback"]
 default = ["default-tls", "http-api-client"]
 
 tokio-console = ["console-subscriber", "tokio/tracing"]

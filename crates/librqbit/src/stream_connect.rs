@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
+use librqbit_core::network_policy::is_public_socket_addr;
 use librqbit_dualstack_sockets::ConnectOpts;
 use librqbit_utp::{BindDevice, UtpSocketUdp};
 use serde::Serialize;
@@ -213,6 +214,12 @@ impl StreamConnector {
         &self,
         addr: SocketAddr,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+        if !peer_address_allowed(addr, local_peer_fixtures_enabled()) {
+            return Err(Error::Anyhow(anyhow::anyhow!(
+                "refusing non-public peer address {addr}"
+            )));
+        }
+
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
                 "invalid peer address (port 0): {}",
@@ -327,9 +334,27 @@ impl StreamConnector {
     }
 }
 
+fn local_peer_fixtures_enabled() -> bool {
+    cfg!(any(test, all(feature = "test-loopback", debug_assertions)))
+}
+
+fn peer_address_allowed(addr: SocketAddr, allow_test_local: bool) -> bool {
+    is_public_socket_addr(addr) || (allow_test_local && local_peer_fixtures_enabled())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_peer_addresses_require_an_explicit_test_fixture_opt_in() {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        assert!(!peer_address_allowed(addr, false));
+        assert_eq!(
+            peer_address_allowed(addr, true),
+            local_peer_fixtures_enabled()
+        );
+    }
 
     #[test]
     fn test_parse_socks5() {
